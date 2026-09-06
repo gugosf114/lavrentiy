@@ -422,12 +422,15 @@ def _action_complete_partial(uid, tier_config, body):
 def _action_transcribe_audio(uid, tier_config, body):
     """Authenticated mobile audio transcription.
 
-    WiM sends a base64-encoded WAV here so release builds never need an
-    OpenAI secret on the phone.  `whisper-1` keeps verbose segment confidence
-    for L4; `gpt-4o-transcribe` is the faster normal cloud path.
+    WiM sends the recording here so release builds never need an OpenAI
+    secret on the phone — as base64 JSON (older builds) or as a raw
+    multipart `file` part (2026-09-06 builds).  `whisper-1` keeps verbose
+    segment confidence for L4; `gpt-4o-transcribe` is the faster normal
+    cloud path.
     """
     try:
-        kwargs, audio_bytes_len, model = prepare_audio_request(body)
+        kwargs, audio_bytes_len, model = prepare_audio_request(
+            body, audio_bytes=body.get("_audio_bytes"))
     except AudioRequestError as e:
         return (json.dumps({"error": str(e)}), e.status, CORS_HEADERS)
 
@@ -456,15 +459,20 @@ def _action_transcribe_audio(uid, tier_config, body):
 
     text = (payload.get("text") or "").strip()
     segments = payload.get("segments") or []
+    words = payload.get("words") or []
     _emit(logging.INFO, event="transcribe_audio_ok", uid=uid, model=model,
           latency_ms=round((time.time() - t_call) * 1000),
-          audio_bytes=audio_bytes_len, segments=len(segments))
-    return (json.dumps({
+          audio_bytes=audio_bytes_len, segments=len(segments), words=len(words),
+          envelope="raw" if body.get("_audio_bytes") is not None else "wrapped")
+    out = {
         "text": text,
         "segments": segments,
         "model": model,
         "remaining": remaining,
-    }), 200, _JSON_CORS)
+    }
+    if words:
+        out["words"] = words
+    return (json.dumps(out), 200, _JSON_CORS)
 
 
 def _action_learn_profile(uid, tier_config, body):
@@ -633,10 +641,22 @@ def handle(request):
     tier_name = get_user_tier(uid, reviewer=reviewer)
     tier_config = TIERS.get(tier_name, TIERS["invite"])
 
-    try:
-        body = request.get_json(silent=True) or {}
-    except Exception:
-        return (json.dumps({"error": "Invalid JSON"}), 400, CORS_HEADERS)
+    if (request.content_type or "").lower().startswith("multipart/form-data"):
+        # Raw envelope (2026-09-06): the recording rides as the `file` part,
+        # every other field is a plain form string. Only transcribe_audio
+        # uses it; the bytes travel inside the body under a private key so
+        # the action handlers keep one signature.
+        try:
+            body = {k: v for k, v in request.form.items()}
+            upload = request.files.get("file")
+            body["_audio_bytes"] = upload.read() if upload is not None else b""
+        except Exception:
+            return (json.dumps({"error": "Invalid multipart body"}), 400, CORS_HEADERS)
+    else:
+        try:
+            body = request.get_json(silent=True) or {}
+        except Exception:
+            return (json.dumps({"error": "Invalid JSON"}), 400, CORS_HEADERS)
 
     action = body.get("action")
     if tier_name not in ("basic", "pro") and action not in _ENTITLEMENT_FREE_ACTIONS:
