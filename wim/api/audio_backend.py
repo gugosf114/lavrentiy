@@ -32,16 +32,36 @@ def _sniff_container(audio_bytes):
     return None
 
 
-def prepare_audio_request(body):
-    encoded = body.get("audio_base64") or ""
-    if not isinstance(encoded, str) or not encoded:
-        raise AudioRequestError("Missing 'audio_base64' field")
-    if len(encoded) > ((MAX_AUDIO_BYTES + 2) // 3) * 4:
-        raise AudioRequestError("Audio exceeds 12 MB limit", 413)
-    try:
-        audio_bytes = base64.b64decode(encoded, validate=True)
-    except (ValueError, binascii.Error):
-        raise AudioRequestError("Invalid base64 audio")
+def _truthy(value, default=False):
+    """Booleans arrive as JSON bools on the wrapped route and as strings
+    ("true"/"false") on the multipart route. bool("false") is True — so
+    parse, don't cast."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def prepare_audio_request(body, audio_bytes=None):
+    """Two envelopes, one recording.
+
+    - Wrapped (original): JSON body with `audio_base64`. Every build already
+      in the wild sends this; it stays.
+    - Raw (2026-09-06): multipart/form-data with the audio as the `file`
+      part; `handle()` passes the bytes in as `audio_bytes`. A third fewer
+      bytes over the phone's uplink and no decode step here.
+    """
+    if audio_bytes is None:
+        encoded = body.get("audio_base64") or ""
+        if not isinstance(encoded, str) or not encoded:
+            raise AudioRequestError("Missing 'audio_base64' field or 'file' part")
+        if len(encoded) > ((MAX_AUDIO_BYTES + 2) // 3) * 4:
+            raise AudioRequestError("Audio exceeds 12 MB limit", 413)
+        try:
+            audio_bytes = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error):
+            raise AudioRequestError("Invalid base64 audio")
     if not audio_bytes or len(audio_bytes) > MAX_AUDIO_BYTES:
         raise AudioRequestError("Audio is empty or exceeds 12 MB limit", 413)
     container = _sniff_container(audio_bytes)
@@ -60,14 +80,19 @@ def prepare_audio_request(body):
     # OpenAI picks its demuxer off the filename, not the bytes — an .m4a body
     # announced as .wav is rejected as corrupt.
     audio_file.name = "wim-recording." + container
-    verbose = bool(body.get("verbose_segments", True)) and model == "whisper-1"
+    verbose = _truthy(body.get("verbose_segments"), default=True) and model == "whisper-1"
     kwargs = {
         "model": model,
         "file": audio_file,
-        "language": (body.get("language") or "en")[:16],
+        "language": (str(body.get("language") or "en"))[:16],
         "temperature": temperature,
         "response_format": "verbose_json" if verbose else "json",
     }
+    # Per-word times for the phone's clock-broom (timed filler stripping).
+    # whisper-1 + verbose_json only; word granularity alone drops the
+    # segments array, and the phone still reads segments — ask for both.
+    if verbose and _truthy(body.get("word_timestamps")):
+        kwargs["timestamp_granularities"] = ["word", "segment"]
     prompt = (body.get("prompt") or "").strip()
     if prompt:
         kwargs["prompt"] = prompt[:4000]
